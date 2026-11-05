@@ -5,7 +5,26 @@ const roles={research:['🔎','ササ 企画','需要調査AI'],writer:['✍️'
 $('saveAuto').onclick=async()=>{try{await saveAuto()}catch(e){toast(e.message)}};
 $('startAuto').onclick=async()=>{try{if(!await saveAuto())return;let r=await fetch('/api/runs',{method:'POST'});let d=await r.json();toast(d.started?'AIスタッフが作業を開始しました':d.reason||'開始できません');refresh()}catch(e){toast(e.message)}};
 let autoLoaded=false;
-function renderRuns(runs){$('runs').innerHTML=runs.length?runs.map(r=>`<article style="border-top:1px solid #ddd;padding:12px 0"><b>🐼 #${r.id} ${escapeHTML(r.topic)}</b><p class="hint">${escapeHTML(r.stage||'')} ｜ ${escapeHTML(r.status)}</p>${['research','draft','article','social'].filter(k=>r[k]).map(k=>`<details><summary>${{research:'需要調査',draft:'初稿',article:'監査済み原稿',social:'SNS投稿案'}[k]}</summary><pre style="white-space:pre-wrap;overflow-wrap:anywhere;font:inherit;font-size:13px">${escapeHTML(r[k])}</pre></details>`).join('')}${r.error?`<p>${escapeHTML(r.error)}</p>`:''}${r.status==='pending_approval'?`<div style="display:flex;gap:8px;margin-top:10px"><button data-decision="approved" data-run="${r.id}">✓ 承認（公開はしない）</button><button data-decision="rejected" data-run="${r.id}">↩ 差し戻し</button></div>`:''}</article>`).join(''):'<p class="hint">まだ自動実行履歴はありません。</p>';document.querySelectorAll('[data-decision]').forEach(b=>b.onclick=async()=>{if(!confirm('この案件の判断を保存します。外部公開は行いません。'))return;let r=await fetch('/api/runs/'+b.dataset.run+'/decision',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({decision:b.dataset.decision})});toast(r.ok?'判断を保存しました':'保存できませんでした');refresh()})}
+async function copyFinishedArticle(runId){
+  const run=(window.latestAutoRuns||[]).find(item=>String(item.id)===String(runId));
+  if(!run||!run.article){toast('完成原稿が見つかりません');return}
+  const raw=String(run.article);
+  // The auditor may prepend its findings. Copy only the completed manuscript when separated by a heading.
+  const heading=raw.match(/【修正済み\s*完成原稿】|【完成原稿】/);
+  const article=heading?raw.slice(heading.index+heading[0].length).trim():raw.trim();
+  if(!article){toast('コピーする本文がありません');return}
+  try{
+    if(navigator.clipboard&&window.isSecureContext){await navigator.clipboard.writeText(article)}
+    else{
+      const el=document.createElement('textarea');el.value=article;el.setAttribute('readonly','');
+      el.style.cssText='position:fixed;left:-9999px;top:0';document.body.appendChild(el);
+      el.focus();el.select();el.setSelectionRange(0,el.value.length);
+      const ok=document.execCommand('copy');el.remove();if(!ok)throw new Error('copy failed');
+    }
+    toast('📋 完成原稿を全文コピーしました。noteに貼り付けられます');
+  }catch(e){toast('コピーできませんでした。本文を長押ししてコピーしてください')}
+}
+function renderRuns(runs){window.latestAutoRuns=runs;$('runs').innerHTML=runs.length?runs.map(r=>`<article style="border-top:1px solid #ddd;padding:12px 0"><b>🐼 #${r.id} ${escapeHTML(r.topic)}</b><p class="hint">${escapeHTML(r.stage||'')} ｜ ${escapeHTML(r.status)}</p>${['research','draft','article','social'].filter(k=>r[k]).map(k=>`<details><summary>${{research:'需要調査',draft:'初稿',article:'監査済み原稿',social:'SNS投稿案'}[k]}</summary><pre style="white-space:pre-wrap;overflow-wrap:anywhere;font:inherit;font-size:13px">${escapeHTML(r[k])}</pre></details>`).join('')}${r.article?`<button type="button" data-copy-article="${r.id}" style="margin-top:12px;border:1px solid #12a77e;background:#e1f7ed;color:#087b56;border-radius:10px;padding:12px 15px;font-weight:800;cursor:pointer;width:100%">📋 監査済み完成原稿を全文コピー</button>`:''}${r.error?`<p>${escapeHTML(r.error)}</p>`:''}${r.status==='pending_approval'?`<div style="display:flex;gap:8px;margin-top:10px"><button data-decision="approved" data-run="${r.id}">✓ 承認（公開はしない）</button><button data-decision="rejected" data-run="${r.id}">↩ 差し戻し</button></div>`:''}</article>`).join(''):'<p class="hint">まだ自動実行履歴はありません。</p>';document.querySelectorAll('[data-copy-article]').forEach(b=>b.onclick=()=>copyFinishedArticle(b.dataset.copyArticle));document.querySelectorAll('[data-decision]').forEach(b=>b.onclick=async()=>{if(!confirm('この案件の判断を保存します。外部公開は行いません。'))return;let r=await fetch('/api/runs/'+b.dataset.run+'/decision',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({decision:b.dataset.decision})});toast(r.ok?'判断を保存しました':'保存できませんでした');refresh()})}
 const originalRefresh=refresh;refresh=async function(){await originalRefresh();try{let r=await fetch('/api/status');if(!r.ok)return;let d=await r.json();if(!autoLoaded){$('autoTopic').value=d.settings.topic||'';$('autoAudience').value=d.settings.audience||'';$('autoPrice').value=d.settings.price||1980;$('autoUrl').value=d.settings.note_url||'';autoLoaded=true}renderRuns(d.runs||[])}catch(e){}};
 setInterval(()=>{if(document.visibilityState==='visible')refresh()},12000);
 setInterval(()=>$('clock').textContent=new Date().toLocaleString('ja-JP'),1000);draw();refresh();
