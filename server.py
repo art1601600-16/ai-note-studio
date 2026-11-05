@@ -213,53 +213,126 @@ def analyze_reader_problem(ctx):
  return {k: data[k].strip() for k in READER_FIELDS}
 
 
+ARTICLE_ONLY = (
+ 'これは購入者が読む有料noteの完成本文です。制作者向けの企画書・タイトル分析・市場分析・'
+ '販売戦略・OSの説明・監査報告は本文に絶対に書かない。'
+ 'ユーザー確定の正式タイトルと販売価格を変更しない。'
+ '彼の内心など第三者の心理を行動から確定診断しない。'
+ '連絡頻度、返信時間、Yesの個数、割合などに根拠のない判定閾値を設定しない。'
+ '読者の意思・境界線・相手との直接の意思確認を重視する。'
+ '本文の最初に正式タイトルや価格、章番号を繰り返さない。'
+ '見出しは###以下のみ使い、#または##で始まる見出しは一切書かない。'
+)
+
+# Explicitly block editor-facing material from appearing in a paid chapter.
+EDITORIAL_LEAK = re.compile(
+ r'(?:タイトルを最適化|タイトル案の多角的検討|タイトル選定の決定基準|'
+ r'競合と市場需要に関する考察|読者の到達状態|本noteのタイトルは|'
+ r'タイトルの基本構造|購入率を高める|マーケティング戦略|'
+ r'競合との差別化を図|商品設計の観点|制作OS|監査担当|販売導線の設計)'
+)
+CHAPTER_HEADING = re.compile(r'^\s{0,3}#{1,2}\s*第\s*[0-9０-９]+\s*章(?:\b|[：:｜|.．、\-—\s])', re.M)
+INNER_HEADING = re.compile(r'^\s{0,3}#{1,2}\s+\S', re.M)
+NUMERIC_DIAGNOSIS = re.compile(
+ r'(?:(?:[0-9０-９]+\s*(?:個|回|件|%|％|時間|日|週間|か月|ヶ月|ヵ月)\s*(?:以上|以下|以内|未満|超|なら|で))|'
+ r'(?:[0-9０-９]+\s*[～〜~\-]\s*[0-9０-９]+\s*(?:個|回|件)))'
+ r'[^。\n]{0,95}(?:本命|都合のいい|交際意思|本気度|脈あり|可能性が高い)'
+)
+
+
+def chapter_body_issues(body, facts=None):
+ issues = []
+ if len(body.strip()) < 900:
+  issues.append('本文が短い（900文字未満）')
+ if INNER_HEADING.search(body):
+  issues.append('章本文に#または##見出しが混入')
+ if EDITORIAL_LEAK.search(body):
+  issues.append('購入者向けでないタイトル・マーケティング等の内部設計が混入')
+ if NUMERIC_DIAGNOSIS.search(body):
+  issues.append('未検証の数値で相手の本気度を判定している')
+ if facts:
+  if facts['official_title'] in body:
+   issues.append('正式タイトルが章本文に重複')
+  if re.search(r'販売価格\s*[：:]\s*[\d,]+\s*円', body):
+   issues.append('販売価格が章本文に重複')
+ return issues
+
+
+def chapter_text(raw, facts=None):
+ """Remove only leading repeated metadata; never silently discard interior content."""
+ body = clean_section(raw)
+ lines = body.splitlines()
+ while lines:
+  first = lines[0].strip()
+  if not first:
+   lines.pop(0)
+  elif facts and first.lstrip('# ').strip().strip('「」『』') == facts['official_title']:
+   lines.pop(0)
+  elif re.fullmatch(r'(?:販売)?価格\s*[：:]\s*[\d,]+\s*円', first):
+   lines.pop(0)
+  elif re.match(r'^#{1,3}\s*第\s*[0-9０-９]+\s*章', first):
+   lines.pop(0)
+  else:
+   break
+ return '\n'.join(lines).strip()
+
+
+def generate_chapter(idx, ch, base, plan_text, free, previous, facts=None, feedback=''):
+ heading = f'## 第{idx}章 {normalize_chapter_title(ch["title"])}'
+ context = (base + '\n全体設計（本文に転記しない）:\n' + plan_text +
+            '\n無料部分（重複禁止）:\n' + free[:4000] +
+            '\n既出章の要点（重複禁止）:\n' + previous +
+            '\n修正指示:\n' + feedback[:9000])
+ problems = []
+ for attempt in range(1, 4):
+  raw = ai('writer',
+   f'第{idx}章の購入者向け本文だけを書く。担当章の設計: {json.dumps(ch,ensure_ascii=False)}。'
+   '章の目的に直接答える実践的な説明、会話例、返答別の次の行動を作る。'
+   '企画会議や記事の書き方を教える内容は禁止。'
+   '心理・成功率を根拠なく断定しない。具体的な読者の選択を支援する。'
+   '目安1500〜2500文字。章見出し、正式タイトル、価格は書かない。'
+   + ('前回の欠陥を必ず解消する: ' + '／'.join(problems) if problems else ''),
+   context, max_tokens=5200, system_extra=ARTICLE_ONLY)
+  body = chapter_text(raw, facts)
+  problems = chapter_body_issues(body, facts)
+  if not problems:
+   return heading + '\n\n' + body
+ raise RuntimeError(f'第{idx}章の生成が3回とも不合格: ' + '／'.join(problems))
+
+
 def create_paid_note(ctx, research, facts=None):
- base = ctx + '\n需要仮説（未検証）:\n' + research
+ base = ctx + '\n需要仮説（未検証・本文に転記しない）:\n' + research
  plan = json_ai('writer',
   '有料note制作OSの設計段階を実行。JSONのみ。キー: reader_problem, core_answer, unique_deliverable, free_promise, paid_promise, chapter_plan。'
-  'chapter_planは5〜7章、各要素はtitle,purpose,deliverable。核心問題の解決順に並べる。'
-  '読者が購入後に実行できる成果物、返答別の対応、期限の決め方、反例を設計する。'
-  '根拠のない診断点数、架空の実話、研究名の捏造は禁止。'
-  '無料部分では具体的な1つの判断手順を完結させ、有料第1章ではその説明を繰り返さない。'
-  '有料の中心はテーマ固有の核心課題の解決、状況別の判断・実行手順・失敗時の対処・完成成果物。'
-  '単なる記録ワークや精神論で文字数を水増ししない。', base, max_tokens=4500)
+  'chapter_planは5〜7章、各要素はtitle,purpose,deliverable。読者の核心問題の解決順に並べる。'
+  '記事の書き方やタイトル分析を購入者向けの章にしない。'
+  '有料第1章から読者が欲しい答えを提供し、状況別判断・会話例・期限と行動まで完結させる。'
+  '相手の内心を断定せず、根拠のない診断点数・閾値・実績・研究を捏造しない。'
+  '無料部分では有益な判断手順を一つ完結させ、有料本文と重複させない。',
+  base, max_tokens=4500)
  chapters = plan.get('chapter_plan')
  if not isinstance(chapters, list) or not CHAPTER_MIN <= len(chapters) <= CHAPTER_MAX:
   raise RuntimeError('章設計が不正：5〜7章が必要です')
  for ch in chapters:
-  if not isinstance(ch, dict) or any(not isinstance(ch.get(k), str) or not ch[k].strip() for k in ('title', 'purpose', 'deliverable')):
+  if not isinstance(ch, dict) or any(not isinstance(ch.get(k), str) or not ch[k].strip() for k in ('title','purpose','deliverable')):
    raise RuntimeError('章設計にtitle/purpose/deliverableがありません')
+  if EDITORIAL_LEAK.search(ch['title']):
+   raise RuntimeError('章設計に制作者向けの内部設計が混入しました。再実行してください')
  plan_text = json.dumps(plan, ensure_ascii=False, indent=2)
  free = ai('writer',
-  '無料部分の本文だけを作成。正式タイトルが指定されている場合は正確に含める。'
-  '冒頭は具体的な読者の悩みから始め、無料だけでも有益な判断を提供。'
-  '有料部分で得られる完成成果物を自然に提示。出典不明の研究や架空の実績は書かない。'
-  '無料部分だけで実行できる具体的な確認手順を必ず1つ完結させる。'
-  '有料部分の予告は末尾の1段落だけにする。'
-  '目安1200〜2000文字。章番号や【無料部分】という区切りは出力しない。',
-  base+'\n設計:\n'+plan_text, max_tokens=4000)
+  '購入者向けの無料本文だけを書く。読者の深い悩みから始め、無料だけで役立つ具体的な判断手順を1つ完成させる。'
+  '有料部分の予告は末尾の1段落のみ。章番号や区切りは書かない。1200〜2000文字目安。',
+  base+'\n設計（本文に転記しない）:\n'+plan_text, max_tokens=4000, system_extra=ARTICLE_ONLY)
  if facts:
   free = canonicalize_free(free, facts)
  sections = []
  for idx, ch in enumerate(chapters, 1):
-  heading = f'## 第{idx}章 {normalize_chapter_title(ch["title"])}'
-  context = (base+'\n全体設計:\n'+plan_text+'\n無料部分:\n'+free[:5000]+
-             '\nこれまでの章の要点（重複禁止）:\n'+ '\n'.join(
-             f'{i+1}. {x["title"]}／{x["deliverable"]}' for i,x in enumerate(chapters[:idx-1])))
-  section = ai('writer',
-   f'有料本文の第{idx}章だけ執筆。設計:{json.dumps(ch,ensure_ascii=False)}。'
-   '具体的な判断条件、対話例、返答別の分岐、読者が使える完成ワークと記入例を提供。'
-   '出典がない事例は「架空の例」と明示し、結果を創作して実話のように書かない。'
-   '出典不明の研究・統計・専門知識を事実として断定しない。'
-   '検証されていない独自スコアや閾値を、予測精度のある診断として扱わない。'
-   'テーマに応じて判断条件、状況別対応、実行期限、失敗時の次の行動を具体化する。'
-   '無料部分と既出章の説明を繰り返さない。'
-   '見出しの章番号は自分で書かない。他章を再掲しない。1500〜2500文字を目安に完成させる。',
-   context, max_tokens=5000)
-  section = re.sub(r'^\s*#{1,3}\s*第\s*[0-9０-９]+\s*章[^\n]*\n?', '', clean_section(section)).strip()
-  section = strip_repeated_heading(section, normalize_chapter_title(ch['title']))
-  sections.append(heading+'\n\n'+section)
- return build_article(free, sections)
+  previous = '\n'.join(f'{i+1}. {x["title"]}／{x["deliverable"]}' for i,x in enumerate(chapters[:idx-1]))
+  sections.append(generate_chapter(idx,ch,base,plan_text,free,previous,facts))
+ article = build_article(free, sections)
+ problems = validate_article(article, ctx, facts, expected_chapters=len(chapters))
+ # Return a draft for the existing audit-and-repair pipeline. Never approve while issues remain.
+ return article
 
 
 class JobIn(BaseModel):
@@ -404,8 +477,11 @@ def validate_article(article, ctx='', facts=None, expected_chapters=None):
   m = re.match(r'^\s*#{1,2}\s*第\s*([0-9０-９]+)\s*章',section)
   if not m or int(m.group(1).translate(str.maketrans('０１２３４５６７８９','0123456789'))) != i:
    issues.append(f'第{i}章の番号が不一致')
-  if len(section) < 700:
+  if len(section) < 900:
    issues.append(f'第{i}章の本文が短すぎる')
+  body = section.split('\n', 1)[1] if '\n' in section else ''
+  for problem in chapter_body_issues(body, facts):
+   issues.append(f'第{i}章: {problem}')
  if expected_chapters is not None and len(sections) != expected_chapters:
   issues.append('設計時の章数と完成原稿の章数が一致しない')
  issues.extend(editorial_guardrails(article))
@@ -446,6 +522,9 @@ def audit_note(article, ctx):
   '外部検索が実行されていないのでmarket_verifiedはfalse。'
   '需要と競合に外部根拠がなければ、それぞれ最大69点にする。'
   '本文の表現に証拠のない購入率、実績、科学的診断があれば重大欠陥。'
+  'タイトル分析・市場分析・執筆ノウハウなど制作者向け内容が購入者向け本文に混入した場合は重大欠陥。'
+  '章の重複、同じワークの繰り返し、根拠のない回数・日数・割合による本命判定は重大欠陥。'
+  '彼の心理を断定せず、読者が相手と意思確認し自分の境界線を決められるかを評価。'
   '監査点は予測売上ではなく原稿の暫定品質評価。')
  data = json_ai('audit',prompt,ctx+'\n監査対象全文:\n'+article,max_tokens=4500)
  raw_scores = data.get('scores')
@@ -480,33 +559,29 @@ def repair_note(article, ctx, structural_issues, report, facts=None):
   'fix_instructions':report.get('fix_instructions','')},ensure_ascii=False)
  if '【有料部分】' not in article:
   raise RuntimeError('無料・有料区切りがありません')
- free,paid = article.split('【有料部分】',1)
- sections,prefix = split_chapters(paid)
+ free, paid = article.split('【有料部分】', 1)
+ sections, prefix = split_chapters(paid)
  if prefix or not CHAPTER_MIN <= len(sections) <= CHAPTER_MAX:
   raise RuntimeError('章境界を安全に識別できないため自動改稿を停止しました')
  free_new = ai('writer',
-  '無料部分のみを改善。正式タイトルと指定価格を維持し、重要な内容を省略しない。'
-  '未確認の研究・実績を断定しない。無料部分だけで役立つ具体的な確認手順を完成させる。'
-  '有料内容の予告は末尾の1段落のみ。区切り見出しを出力しない。',
-  ctx+'\n監査指摘:\n'+feedback+'\n元原稿:\n'+free,max_tokens=4200)
+  '無料部分だけ改善。無料で実行できる判断手順を完成させ、予告は末尾の1段落のみ。'
+  '本文を省略せず、記事の書き方や市場分析は書かない。',
+  ctx+'\n監査指摘:\n'+feedback+'\n元原稿:\n'+free,
+  max_tokens=4200, system_extra=ARTICLE_ONLY)
  if facts:
-  free_new = canonicalize_free(free_new,facts)
+  free_new = canonicalize_free(free_new, facts)
  revised = []
- for idx,section in enumerate(sections,1):
+ for idx, section in enumerate(sections, 1):
   heading = section.split('\n',1)[0].strip()
+  title = normalize_chapter_title(heading)
   body = section.split('\n',1)[1].strip() if '\n' in section else ''
-  revised_body = ai('writer',
-   f'第{idx}章の本文のみを監査指摘に沿って修正。章見出しや別の章は書かない。'
-   '有益な情報を残し、具体的な行動・返答別の判断・完成成果物を強化。'
-   '根拠のない実話や研究は削除するか「架空の例」と明示。短縮・省略しない。'
-   '根拠のない数値診断・成功確率・独自閾値を削除し、検証可能な事実と用途を明示した判断基準に変更する。'
-   '無料部分や他章との重複を除き、テーマに適した具体例、条件分岐、実行期限と次の行動を補う。',
-   ctx+'\n監査指摘:\n'+feedback+'\n対象本文:\n'+body,max_tokens=6000)
-  revised_body = re.sub(r'^\s*#{1,3}\s*第\s*[0-9０-９]+\s*章[^\n]*\n?', '',clean_section(revised_body)).strip()
-  revised_body = strip_repeated_heading(revised_body, normalize_chapter_title(heading))
-  revised.append(heading+'\n\n'+revised_body)
+  ch = {'title':title,'purpose':'監査指摘を修正して読者の核心問題を解決する',
+        'deliverable':'読者が判断して次に取る行動が決まる具体的な手順'}
+  chapter_feedback = ('対象の元本文（残すべき有益な内容は維持）:\n'+body[:14000]+
+                      '\n全体監査の指摘:\n'+feedback)
+  previous = '\n'.join(f'{j+1}. {normalize_chapter_title(x.splitlines()[0])}' for j,x in enumerate(sections[:idx-1]))
+  revised.append(generate_chapter(idx,ch,ctx,'既存の章構成を維持',free_new,previous,facts,chapter_feedback))
  return build_article(free_new,revised)
-
 
 def pipeline(run_id, config):
  try:
