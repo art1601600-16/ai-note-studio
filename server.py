@@ -1,6 +1,5 @@
-import os, json, sqlite3, datetime, threading, secrets, re, logging, hashlib
+import os, json, sqlite3, datetime, threading, secrets, re, logging
 from pathlib import Path
-from typing import Any
 from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -37,8 +36,8 @@ CRITERIA = {
 TARGET_SCORE = 90
 MAX_ROUNDS = max(1, min(int(os.getenv('MAX_AUDIT_ROUNDS', '3')), 5))
 WRITER_OS_PATH = ROOT / 'os' / 'writer.md'
-CHAPTER_MIN = 5
-CHAPTER_MAX = 7
+CHAPTER_MIN, CHAPTER_MAX = 5, 7
+READER_FIELDS = ('reader_situation', 'surface_problem', 'core_problem', 'desired_answer', 'actionable_outcome')
 
 
 def connect():
@@ -56,9 +55,10 @@ def init_db():
   cols = {row[1] for row in c.execute('PRAGMA table_info(runs)')}
   if 'config_snapshot' not in cols:
    c.execute("ALTER TABLE runs ADD COLUMN config_snapshot TEXT DEFAULT '{}'")
+  if 'reader_analysis' not in cols:
+   c.execute("ALTER TABLE runs ADD COLUMN reader_analysis TEXT DEFAULT ''")
   c.execute('CREATE TABLE IF NOT EXISTS audit_reports (run_id INTEGER, round INTEGER, report TEXT, passed INTEGER, created_at TEXT, PRIMARY KEY(run_id,round))')
 init_db()
-# Threads do not survive a process restart; mark orphaned runs explicitly.
 with connect() as _c:
  _c.execute("UPDATE runs SET status='interrupted', stage='サーバー再起動で中断', error='処理が中断されました。再実行してください。' WHERE status IN ('running','queued')")
 
@@ -134,11 +134,13 @@ def json_ai(role, task, context='', *, max_tokens=3500):
 
 
 def fixed_context(config):
- """Every model receives the same immutable, user-approved facts."""
  topic = str(config.get('topic', '')).strip()
- title = str(config.get('official_title', '')).strip() or topic
- audience = str(config.get('audience', 'note初心者')).strip()
- price = int(config.get('price', 1980))
+ title = str(config.get('official_title', '')).strip()
+ audience = str(config.get('audience', '')).strip()
+ try:
+  price = int(config.get('price', 1980))
+ except (ValueError, TypeError) as exc:
+  raise ValueError('価格が整数ではありません') from exc
  if not topic or not title or not audience or not (100 <= price <= 100000):
   raise ValueError('テーマ・正式タイトル・対象読者・価格の設定が不正です')
  facts = {'topic': topic, 'official_title': title, 'audience': audience, 'price': price}
@@ -153,14 +155,11 @@ def normalize_chapter_title(title):
 
 
 def clean_section(text):
- text = str(text).strip()
- text = re.sub(r'^\s*【(?:無料|有料)部分】\s*', '', text)
- return text.strip()
+ return re.sub(r'^\s*【(?:無料|有料)部分】\s*', '', str(text).strip()).strip()
 
 
 def build_article(free, chapters):
- return ('【無料部分】\n' + clean_section(free) + '\n\n【有料部分】\n' +
-         '\n\n'.join(chapters)).strip()
+ return ('【無料部分】\n' + clean_section(free) + '\n\n【有料部分】\n' + '\n\n'.join(chapters)).strip()
 
 
 def strip_repeated_heading(body, title):
@@ -171,10 +170,8 @@ def strip_repeated_heading(body, title):
 
 
 def canonicalize_free(free, facts):
- """Canonical header is owned by the server, not the model."""
  free = clean_section(free)
  title = facts['official_title']
- # Remove a model-generated first heading/title, but never edit quotations in the body.
  lines = free.splitlines()
  if lines and (lines[0].lstrip('# ').strip() == title or lines[0].startswith('# ')):
   lines = lines[1:]
@@ -184,7 +181,6 @@ def canonicalize_free(free, facts):
 
 
 def split_chapters(paid):
- """Split only top-level 第N章, never subsection 3-2 or 5-4."""
  pat = re.compile(r'(?m)^\s{0,3}#{1,2}\s*第\s*([0-9０-９]+)\s*章\b[^\n]*')
  matches = list(pat.finditer(paid))
  if not matches:
@@ -195,8 +191,29 @@ def split_chapters(paid):
  return sections, prefix
 
 
+def analyze_reader_problem(ctx):
+ """First gate: clarify the reader's problem before generating an article."""
+ prompt = (
+  '有料noteの商品設計前に、読者の悩みの深さと必要な答えを分析する。記事本文は書かない。'
+  'JSONオブジェクトのみ返す。必須キーは reader_situation, surface_problem, core_problem, '
+  'desired_answer, actionable_outcome。'
+  'reader_situation: 読者の置かれた具体的状況。'
+  'surface_problem: 読者が自覚している表面的な悩み。'
+  'core_problem: 今は自分で解決できない核心問題。'
+  'desired_answer: 読者が今すぐ欲しい具体的な答え。'
+  'actionable_outcome: 読後に読者が判断または実行できること。'
+  '各項目は20文字以上で具体的に書き、抽象的な励ましや一般論で埋めない。'
+  '実在する読者への調査ではないので心理・購入意欲は仮説と明記する。'
+  '相手の内心など確認不能な事実を断定せず、読者自身が確かめられる情報を重視する。'
+ )
+ data = json_ai('research', prompt, ctx, max_tokens=2500)
+ missing = [k for k in READER_FIELDS if not isinstance(data.get(k), str) or len(data[k].strip()) < 20]
+ if missing:
+  raise RuntimeError('読者分析が不十分です。未完成項目: ' + ', '.join(missing))
+ return {k: data[k].strip() for k in READER_FIELDS}
+
+
 def create_paid_note(ctx, research, facts=None):
- """Plan once; generate chapters independently; enforce headings in code."""
  base = ctx + '\n需要仮説（未検証）:\n' + research
  plan = json_ai('writer',
   '有料note制作OSの設計段階を実行。JSONのみ。キー: reader_problem, core_answer, unique_deliverable, free_promise, paid_promise, chapter_plan。'
@@ -210,7 +227,7 @@ def create_paid_note(ctx, research, facts=None):
  if not isinstance(chapters, list) or not CHAPTER_MIN <= len(chapters) <= CHAPTER_MAX:
   raise RuntimeError('章設計が不正：5〜7章が必要です')
  for ch in chapters:
-  if not isinstance(ch, dict) or any(not str(ch.get(k, '')).strip() for k in ('title','purpose','deliverable')):
+  if not isinstance(ch, dict) or any(not isinstance(ch.get(k), str) or not ch[k].strip() for k in ('title', 'purpose', 'deliverable')):
    raise RuntimeError('章設計にtitle/purpose/deliverableがありません')
  plan_text = json.dumps(plan, ensure_ascii=False, indent=2)
  free = ai('writer',
@@ -222,10 +239,8 @@ def create_paid_note(ctx, research, facts=None):
   '目安1200〜2000文字。章番号や【無料部分】という区切りは出力しない。',
   base+'\n設計:\n'+plan_text, max_tokens=4000)
  if facts:
-  title = facts['official_title']
-  free = clean_section(free)
   free = canonicalize_free(free, facts)
- sections=[]
+ sections = []
  for idx, ch in enumerate(chapters, 1):
   heading = f'## 第{idx}章 {normalize_chapter_title(ch["title"])}'
   context = (base+'\n全体設計:\n'+plan_text+'\n無料部分:\n'+free[:5000]+
@@ -241,8 +256,7 @@ def create_paid_note(ctx, research, facts=None):
    '無料部分と既出章の説明を繰り返さない。'
    '見出しの章番号は自分で書かない。他章を再掲しない。1500〜2500文字を目安に完成させる。',
    context, max_tokens=5000)
-  section = clean_section(section)
-  section = re.sub(r'^\s*#{1,3}\s*第\s*[0-9０-９]+\s*章[^\n]*\n?', '', section).strip()
+  section = re.sub(r'^\s*#{1,3}\s*第\s*[0-9０-９]+\s*章[^\n]*\n?', '', clean_section(section)).strip()
   section = strip_repeated_heading(section, normalize_chapter_title(ch['title']))
   sections.append(heading+'\n\n'+section)
  return build_article(free, sections)
@@ -261,8 +275,8 @@ class MetricIn(BaseModel):
  revenue: int = Field(ge=0, default=0)
 class SettingsIn(BaseModel):
  topic: str = Field(min_length=3, max_length=500)
- official_title: str = Field(default='', max_length=500)
- audience: str = Field(default='note初心者', max_length=500)
+ official_title: str = Field(min_length=1, max_length=500)
+ audience: str = Field(min_length=1, max_length=500)
  price: int = Field(default=1980, ge=100, le=100000)
  note_url: str = Field(default='', max_length=500)
 class DecisionIn(BaseModel):
@@ -272,15 +286,17 @@ class DecisionIn(BaseModel):
 @app.get('/')
 def home(_: bool = Depends(auth)):
  return FileResponse(ROOT / 'static' / 'index.html')
+
 @app.get('/api/status')
 def status(_: bool = Depends(auth)):
  with connect() as c:
   jobs = [dict(r) for r in c.execute('SELECT * FROM jobs ORDER BY id DESC LIMIT 50')]
   metrics = [dict(r) for r in c.execute('SELECT * FROM metrics ORDER BY id DESC LIMIT 30')]
   runs = [dict(r) for r in c.execute('SELECT * FROM runs ORDER BY id DESC LIMIT 30')]
-  settings = {r['key']:r['value'] for r in c.execute('SELECT * FROM settings')}
+  settings = {r['key']: r['value'] for r in c.execute('SELECT * FROM settings')}
  return {'connected': bool(os.getenv('OPENAI_API_KEY')), 'jobs': jobs, 'metrics': metrics,
          'runs': runs, 'settings': settings, 'roles': {k:v[0] for k,v in ROLES.items()}}
+
 @app.get('/api/runs/{rid}/audits')
 def get_audits(rid: int, _: bool = Depends(auth)):
  with connect() as c:
@@ -288,9 +304,12 @@ def get_audits(rid: int, _: bool = Depends(auth)):
    raise HTTPException(404, '対象の実行がありません')
   rows = [dict(r) for r in c.execute('SELECT * FROM audit_reports WHERE run_id=? ORDER BY round', (rid,))]
  for row in rows:
-  try: row['report'] = json.loads(row['report'])
-  except (TypeError, ValueError): pass
+  try:
+   row['report'] = json.loads(row['report'])
+  except (TypeError, ValueError):
+   pass
  return {'run_id': rid, 'target_score': TARGET_SCORE, 'reports': rows}
+
 @app.post('/api/jobs')
 def job(payload: JobIn, _: bool = Depends(auth)):
  if payload.role not in ROLES:
@@ -310,23 +329,26 @@ def job(payload: JobIn, _: bool = Depends(auth)):
  with LOCK, connect() as c:
   c.execute('UPDATE jobs SET output=?,status=? WHERE id=?',(output,state,jid))
  return {'id':jid,'role':payload.role,'task':payload.task,'output':output,'status':state,'created_at':created}
+
 @app.post('/api/metrics')
 def metric(payload: MetricIn, _: bool = Depends(auth)):
- try: datetime.date.fromisoformat(payload.day)
- except ValueError: raise HTTPException(400,'日付形式は YYYY-MM-DD')
+ try:
+  datetime.date.fromisoformat(payload.day)
+ except ValueError:
+  raise HTTPException(400,'日付形式は YYYY-MM-DD')
  with LOCK, connect() as c:
   c.execute('INSERT INTO metrics(day,impressions,views,likes,sales,revenue) VALUES(?,?,?,?,?,?)',
             (payload.day,payload.impressions,payload.views,payload.likes,payload.sales,payload.revenue))
  return {'ok':True}
+
 @app.post('/api/settings')
 def save_settings(p: SettingsIn, _: bool = Depends(auth)):
+ values = p.model_dump()
+ for k in ('topic', 'official_title', 'audience'):
+  values[k] = values[k].strip()
+  if not values[k]:
+   raise HTTPException(422, f'{k}を入力してください')
  with LOCK, connect() as c:
-  values = p.model_dump()
-  if not values.get('official_title'):
-   old = c.execute("SELECT value FROM settings WHERE key='official_title'").fetchone()
-   previous_topic = c.execute("SELECT value FROM settings WHERE key='topic'").fetchone()
-   old_title = old['value'].strip() if old else ''
-   values['official_title'] = (old_title if old_title and (not previous_topic or old_title != previous_topic['value']) else p.topic)
   for k,v in values.items():
    c.execute('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',(k,str(v)))
  return {'ok':True, 'official_title':values['official_title']}
@@ -334,7 +356,7 @@ def save_settings(p: SettingsIn, _: bool = Depends(auth)):
 
 def update(run_id, **fields):
  fields['updated_at'] = now()
- allowed = {'status','stage','topic','research','draft','article','social','decision','error','updated_at','config_snapshot'}
+ allowed = {'status','stage','topic','research','reader_analysis','draft','article','social','decision','error','updated_at','config_snapshot'}
  if any(k not in allowed for k in fields):
   raise ValueError('不正な更新カラム')
  with LOCK, connect() as c:
@@ -342,12 +364,10 @@ def update(run_id, **fields):
 
 
 def editorial_guardrails(article):
- """ジャンル横断の決定的な形式・根拠チェック。意味の妥当性は独立AI監査で検証。"""
  issues = []
  if '【有料部分】' not in article:
   return ['有料本文がありません']
  free, paid = article.split('【有料部分】', 1)
- # 点数表自体は有用な場合がある。未検証スコアから結果・人物属性を断定する場合のみ検出する。
  score = re.search(r'(?:[0-9０-９]+\s*[〜~～－-]\s*[0-9０-９]+\s*点|[0-9０-９]+\s*点\s*(?:以上|以下)|[0-9０-９]+\s*点\s*[／/]\s*[0-9０-９]+\s*点)', paid)
  conclusion = re.search(r'(?:点|スコア|得点)[^。\n]{0,100}(?:確実|必ず|可能性が高い|ほぼ|成功する|失敗する|診断される|判定される)', paid)
  if score and conclusion and not re.search(r'(?:検証済み|妥当性検証|信頼性検証)[^。\n]{0,100}(?:https?://|doi:)', paid, re.I):
@@ -365,23 +385,27 @@ def editorial_guardrails(article):
 
 
 def validate_article(article, ctx='', facts=None, expected_chapters=None):
- issues=[]
+ issues = []
  if article.count('【無料部分】') != 1 or article.count('【有料部分】') != 1:
   return ['無料部分・有料部分の区切りが正確に1つずつ必要です']
  free, paid = article.split('【有料部分】',1)
- if len(free.strip()) < 650: issues.append('無料部分が短すぎる')
- if len(paid.strip()) < 6000: issues.append('有料部分が短すぎる')
+ if len(free.strip()) < 650:
+  issues.append('無料部分が短すぎる')
+ if len(paid.strip()) < 6000:
+  issues.append('有料部分が短すぎる')
  if any(x in paid for x in ('※以下は一部要約','本編概要','ここに本文を','以下省略','（ここでは','（以下は')):
   issues.append('省略・未完成の表現がある')
  sections, prefix = split_chapters(paid)
- if prefix: issues.append('第1章より前に余分な有料本文がある')
+ if prefix:
+  issues.append('第1章より前に余分な有料本文がある')
  if not CHAPTER_MIN <= len(sections) <= CHAPTER_MAX:
   issues.append(f'章数が不正：{len(sections)}章（必要数5〜7章）')
  for i, section in enumerate(sections,1):
   m = re.match(r'^\s*#{1,2}\s*第\s*([0-9０-９]+)\s*章',section)
   if not m or int(m.group(1).translate(str.maketrans('０１２３４５６７８９','0123456789'))) != i:
    issues.append(f'第{i}章の番号が不一致')
-  if len(section) < 700: issues.append(f'第{i}章の本文が短すぎる')
+  if len(section) < 700:
+   issues.append(f'第{i}章の本文が短すぎる')
  if expected_chapters is not None and len(sections) != expected_chapters:
   issues.append('設計時の章数と完成原稿の章数が一致しない')
  issues.extend(editorial_guardrails(article))
@@ -391,13 +415,13 @@ def validate_article(article, ctx='', facts=None, expected_chapters=None):
    issues.append('正式タイトルが先頭に完全一致で記載されていない')
   if not re.search(r'^販売価格：' + re.escape(f"{facts['price']:,}") + r'円$', free, re.M):
    issues.append('販売価格が指定価格と一致しない、または欠落している')
-  if facts['audience'] not in ctx: issues.append('対象読者の固定条件が引き継がれていない')
+  if facts['audience'] not in ctx:
+   issues.append('対象読者の固定条件が引き継がれていない')
   price_pattern = re.compile(r'(?:価格[：:]?\s*|販売価格[：:]?\s*)([0-9,]+)\s*円')
   for val in price_pattern.findall(article):
    if int(val.replace(',','')) != facts['price']:
     issues.append('ユーザー指定価格と異なる価格が記載されている')
     break
- # Claims that require independent verification: prevent approval, not arbitrary rewriting.
  if re.search(r'(?:実際に|実例|リアルな事例|体験談)[^\n]{0,60}(?:成功|達成|改善|解決|効果があった|結果が出た)', article):
   issues.append('実在確認のない成功・結果事例の可能性：出典確認または架空例明示が必要')
  if re.search(r'(?:研究|調査|科学的エビデンス)[^\n]{0,90}(?:による|示され|証明|指摘)',article) and not re.search(r'https?://|doi:|DOI:',article):
@@ -406,7 +430,6 @@ def validate_article(article, ctx='', facts=None, expected_chapters=None):
 
 
 def audit_note(article, ctx):
- """各観点の採点と証拠。市場未調査の90点は認めない。"""
  rubric = json.dumps(CRITERIA, ensure_ascii=False)
  prompt = (
   '原稿を独立監査する。JSONオブジェクトのみ返す。10観点:' + rubric + '\n'
@@ -426,25 +449,23 @@ def audit_note(article, ctx):
   '監査点は予測売上ではなく原稿の暫定品質評価。')
  data = json_ai('audit',prompt,ctx+'\n監査対象全文:\n'+article,max_tokens=4500)
  raw_scores = data.get('scores')
- if not isinstance(raw_scores,dict): raise RuntimeError('監査スコアがありません')
+ if not isinstance(raw_scores,dict):
+  raise RuntimeError('監査スコアがありません')
  scores = {}
  for key in CRITERIA:
   value = raw_scores.get(key)
   if type(value) is not int or not (0 <= value <= 100):
    raise RuntimeError(f'監査項目 {key} の点数が不正です')
   scores[key] = value
- # AIが誤って市場未検証を高得点にしてもサーバー側で上限をかける。
- if data.get('market_verified') is not True:
-  scores['demand'] = min(scores['demand'],69)
-  scores['competition'] = min(scores['competition'],69)
+ scores['demand'] = min(scores['demand'],69)
+ scores['competition'] = min(scores['competition'],69)
  data['scores'] = scores
- data['market_verified'] = False  # 現行実装にWeb市場調査機能はない
+ data['market_verified'] = False
  data['issues'] = [str(x) for x in data.get('issues',[])][:30] if isinstance(data.get('issues'),list) else ['監査の問題一覧が不正']
  data['critical_failures'] = [str(x) for x in data.get('critical_failures',[])][:20] if isinstance(data.get('critical_failures'),list) else ['重大欠陥一覧が不正']
  data['evidence'] = data.get('evidence',{}) if isinstance(data.get('evidence'),dict) else {}
  data['below_target'] = {k:v for k,v in scores.items() if v < TARGET_SCORE}
  data['average_score'] = round(sum(scores.values())/len(scores),1)
- # 未検証の需要・競合は編集品質の合格判定から分離し、公開前の確認事項として残す。
  editorial_keys = [k for k in CRITERIA if k not in ('demand', 'competition')]
  data['editorial_passed'] = (all(scores[k] >= TARGET_SCORE for k in editorial_keys)
                              and not data['critical_failures'] and not data['issues'])
@@ -454,35 +475,34 @@ def audit_note(article, ctx):
 
 
 def repair_note(article, ctx, structural_issues, report, facts=None):
- """Repair each *top-level* chapter and preserve its exact canonical heading."""
- feedback=json.dumps({'scores':report.get('scores',{}),'issues':structural_issues+report.get('issues',[])+report.get('critical_failures',[]),
+ feedback = json.dumps({'scores':report.get('scores',{}),
+  'issues':structural_issues+report.get('issues',[])+report.get('critical_failures',[]),
   'fix_instructions':report.get('fix_instructions','')},ensure_ascii=False)
  if '【有料部分】' not in article:
   raise RuntimeError('無料・有料区切りがありません')
- free,paid=article.split('【有料部分】',1)
- sections,prefix=split_chapters(paid)
+ free,paid = article.split('【有料部分】',1)
+ sections,prefix = split_chapters(paid)
  if prefix or not CHAPTER_MIN <= len(sections) <= CHAPTER_MAX:
   raise RuntimeError('章境界を安全に識別できないため自動改稿を停止しました')
- free_new=ai('writer',
+ free_new = ai('writer',
   '無料部分のみを改善。正式タイトルと指定価格を維持し、重要な内容を省略しない。'
   '未確認の研究・実績を断定しない。無料部分だけで役立つ具体的な確認手順を完成させる。'
   '有料内容の予告は末尾の1段落のみ。区切り見出しを出力しない。',
   ctx+'\n監査指摘:\n'+feedback+'\n元原稿:\n'+free,max_tokens=4200)
- free_new=clean_section(free_new)
  if facts:
-  free_new=canonicalize_free(free_new,facts)
- revised=[]
+  free_new = canonicalize_free(free_new,facts)
+ revised = []
  for idx,section in enumerate(sections,1):
-  heading=section.split('\n',1)[0].strip()
-  body=section.split('\n',1)[1].strip() if '\n' in section else ''
-  revised_body=ai('writer',
+  heading = section.split('\n',1)[0].strip()
+  body = section.split('\n',1)[1].strip() if '\n' in section else ''
+  revised_body = ai('writer',
    f'第{idx}章の本文のみを監査指摘に沿って修正。章見出しや別の章は書かない。'
    '有益な情報を残し、具体的な行動・返答別の判断・完成成果物を強化。'
    '根拠のない実話や研究は削除するか「架空の例」と明示。短縮・省略しない。'
    '根拠のない数値診断・成功確率・独自閾値を削除し、検証可能な事実と用途を明示した判断基準に変更する。'
    '無料部分や他章との重複を除き、テーマに適した具体例、条件分岐、実行期限と次の行動を補う。',
    ctx+'\n監査指摘:\n'+feedback+'\n対象本文:\n'+body,max_tokens=6000)
-  revised_body=re.sub(r'^\s*#{1,3}\s*第\s*[0-9０-９]+\s*章[^\n]*\n?', '',clean_section(revised_body)).strip()
+  revised_body = re.sub(r'^\s*#{1,3}\s*第\s*[0-9０-９]+\s*章[^\n]*\n?', '',clean_section(revised_body)).strip()
   revised_body = strip_repeated_heading(revised_body, normalize_chapter_title(heading))
   revised.append(heading+'\n\n'+revised_body)
  return build_article(free_new,revised)
@@ -491,14 +511,22 @@ def repair_note(article, ctx, structural_issues, report, facts=None):
 def pipeline(run_id, config):
  try:
   facts, ctx = fixed_context(config)
-  topic = facts['topic']
+  update(run_id, stage='第1段階：読者の深い悩みを分析')
+  reader = analyze_reader_problem(ctx)
+  reader_text = json.dumps(reader, ensure_ascii=False, indent=2)
+  update(run_id, reader_analysis=reader_text, research='【読者の核心問題分析・仮説】\n'+reader_text)
+  ctx += '\n\n【読者の核心問題分析（仮説）】\n' + reader_text
   update(run_id,stage='需要仮説の整理')
-  research = ai('research','このテーマの読者課題、購入理由の仮説、競合との差別化仮説を整理。'
-                'Web調査は未実施と明記し、実売上・市場規模を捏造しない。',ctx,max_tokens=4000)
-  update(run_id,stage='記事制作・深層設計',research=research)
+  research = ai('research',
+   '上記の読者分析を踏まえ、読者課題、購入理由の仮説、競合との差別化仮説を整理。'
+   '読者が今すぐ求める答えを具体化し、解決策が弱い場合はその不足を指摘する。'
+   'Web調査は未実施と明記し、実売上・市場規模を捏造しない。',ctx,max_tokens=4000)
+  combined_research = '【読者の核心問題分析・仮説】\n'+reader_text+'\n\n【需要・競合仮説（未検証）】\n'+research
+  update(run_id,stage='記事制作・深層設計',research=combined_research)
   article = create_paid_note(ctx,research,facts)
   update(run_id,stage='初稿完成',draft=article,article=article)
   passed = False
+  report = {}
   for round_num in range(1,MAX_ROUNDS+1):
    update(run_id,stage=f'独立品質監査 {round_num}/{MAX_ROUNDS}',article=article)
    structural_issues = validate_article(article,ctx,facts)
@@ -512,13 +540,13 @@ def pipeline(run_id, config):
    with LOCK, connect() as c:
     c.execute('INSERT OR REPLACE INTO audit_reports(run_id,round,report,passed,created_at) VALUES(?,?,?,?,?)',
               (run_id,round_num,json.dumps(report,ensure_ascii=False),int(passed),now()))
-   if passed: break
+   if passed:
+    break
    if round_num < MAX_ROUNDS:
     update(run_id,stage=f'低評価項目の重点修正 {round_num}/{MAX_ROUNDS-1}')
     article = repair_note(article,ctx,structural_issues,report,facts)
     update(run_id,article=article)
   update(run_id,article=article)
-  # Never let an unvalidated final draft reach approval.
   final_issues = validate_article(article,ctx,facts)
   if final_issues:
    passed = False
@@ -526,7 +554,7 @@ def pipeline(run_id, config):
    scores = report.get('scores',{})
    low = ', '.join(f'{CRITERIA[k]}:{v}' for k,v in scores.items() if v<TARGET_SCORE)
    update(run_id,stage='品質未達・要確認',status='needs_revision',
-          error=f'{MAX_ROUNDS}回の監査後も未合格。{low[:300]}。監査詳細は /api/runs/{run_id}/audits')
+          error=f'{MAX_ROUNDS}回以内の監査で未合格。{low[:300]}。監査詳細は /api/runs/{run_id}/audits')
    return
   update(run_id,stage='SNS投稿準備')
   social = ai('social','合格原稿を宣伝するX向け投稿3つ（各160字以内）、Threads向け2つを作る。投稿は実行しない。',
@@ -541,12 +569,17 @@ def pipeline(run_id, config):
 def launch():
  with LOCK,connect() as c:
   active = c.execute("SELECT id FROM runs WHERE status IN ('queued','running') LIMIT 1").fetchone()
-  if active: return {'started':False,'reason':'既に処理中','id':active['id']}
+  if active:
+   return {'started':False,'reason':'既に処理中','id':active['id']}
   config = {r['key']:r['value'] for r in c.execute('SELECT * FROM settings')}
-  if not config.get('topic'): return {'started':False,'reason':'先に自動運営設定を保存してください'}
-  if not os.getenv('OPENAI_API_KEY'): return {'started':False,'reason':'OPENAI_API_KEY 未設定'}
-  try: writer_os()
-  except RuntimeError as exc: return {'started':False,'reason':str(exc)}
+  if not config.get('topic'):
+   return {'started':False,'reason':'先に自動運営設定を保存してください'}
+  if not os.getenv('OPENAI_API_KEY'):
+   return {'started':False,'reason':'OPENAI_API_KEY 未設定'}
+  try:
+   writer_os()
+  except RuntimeError as exc:
+   return {'started':False,'reason':str(exc)}
   timestamp = now()
   try:
    facts, _ = fixed_context(config)
@@ -557,9 +590,11 @@ def launch():
   rid = cur.lastrowid
  threading.Thread(target=pipeline,args=(rid,config),daemon=True).start()
  return {'started':True,'id':rid}
+
 @app.post('/api/runs')
 def start(_: bool = Depends(auth)):
  return launch()
+
 @app.post('/api/cron')
 def cron(request: Request):
  expected = os.getenv('CRON_SECRET','')
@@ -567,6 +602,7 @@ def cron(request: Request):
  if not expected or not secrets.compare_digest(provided,expected):
   raise HTTPException(403,'Forbidden')
  return launch()
+
 @app.post('/api/runs/{rid}/decision')
 def decide(rid: int,p: DecisionIn,_: bool = Depends(auth)):
  if p.decision not in ('approved','rejected'):
@@ -592,6 +628,7 @@ def decide(rid: int,p: DecisionIn,_: bool = Depends(auth)):
   c.execute('UPDATE runs SET status=?,decision=?,updated_at=? WHERE id=?',
             (p.decision,p.decision,now(),rid))
  return {'ok':True,'published':False,'message':'承認を記録しました。外部公開は行っていません。'}
+
 @app.get('/health')
 def health():
  return {'ok':True}
