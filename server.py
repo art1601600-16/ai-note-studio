@@ -15,7 +15,7 @@ LOCK = threading.RLock()
 ROLES = {
  'research': ('需要調査AI', '市場データを捏造しない。調査できない事実は未検証と記す。読者の悩みとテーマ候補を整理する。'),
  'writer': ('記事制作AI', '有料note自動完成OSに従い、深層読者理解、核心解決設計、無料・有料の価値分担を重視する。架空の実績は書かない。'),
- 'audit': ('品質監査AI', '読者・需要・競合・独自性・具体性・実践性・価格・期待一致・表現・リスクの10観点で監査し、修正版を完成させる。'),
+ 'audit': ('品質監査AI', '読者・需要・競合・独自性・具体性・実践性・価格・期待一致・表現・リスクの10観点で独立監査する。原稿は書き換えず、欠陥と修正指示を返す。'),
  'social': ('SNS宣伝AI', 'X 160字以内とThreads用の投稿案を作る。売上や効果を捏造しない。'),
  'analytics': ('分析AI', '実測データだけで分析。未取得は未取得と明記。'),
  'manager': ('運営管理AI', '計画・承認ポイントを整理。外部公開を完了したと偽らない。')
@@ -31,6 +31,7 @@ with connect() as c:
  c.execute('CREATE TABLE IF NOT EXISTS metrics (id INTEGER PRIMARY KEY AUTOINCREMENT, day TEXT, impressions INTEGER, views INTEGER, likes INTEGER, sales INTEGER, revenue INTEGER)')
  c.execute('CREATE TABLE IF NOT EXISTS runs (id INTEGER PRIMARY KEY AUTOINCREMENT, status TEXT NOT NULL, stage TEXT, topic TEXT, research TEXT DEFAULT "", draft TEXT DEFAULT "", article TEXT DEFAULT "", social TEXT DEFAULT "", decision TEXT DEFAULT "", error TEXT DEFAULT "", created_at TEXT NOT NULL, updated_at TEXT NOT NULL)')
  c.execute('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY,value TEXT NOT NULL)')
+ c.execute('CREATE TABLE IF NOT EXISTS audit_reports (run_id INTEGER, round INTEGER, report TEXT, passed INTEGER, created_at TEXT, PRIMARY KEY(run_id,round))')
 
 def now():
  return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')
@@ -72,7 +73,7 @@ def ai(role, task, context='', *, max_tokens=3500, system_extra=''):
   system += '\n\n追加の制作指示:\n' + system_extra
  result = OpenAI(api_key=os.environ['OPENAI_API_KEY'], timeout=180, max_retries=1).chat.completions.create(
   model=os.getenv('OPENAI_MODEL', 'gpt-4.1-mini'),
-  messages=[{'role':'system','content':system}, {'role':'user','content':f'{task}\n\n参考情報:\n{context[:30000]}'}],
+  messages=[{'role':'system','content':system}, {'role':'user','content':f'{task}\n\n参考情報:\n{context[:100000]}'}],
   max_tokens=max_tokens
  )
  choice = result.choices[0]
@@ -163,6 +164,46 @@ def update(run_id, **fields):
  with LOCK, connect() as c:
   c.execute('UPDATE runs SET '+','.join(f'{k}=?' for k in fields)+' WHERE id=?',(*fields.values(),run_id))
 
+def validate_article(article, topic):
+ """機械的に検査できる欠落を先に弾く。内容品質は別途AI監査する。"""
+ issues = []
+ if '【無料部分】' not in article or '【有料部分】' not in article:
+  issues.append('無料部分・有料部分の区切りがない')
+ else:
+  free, paid = article.split('【有料部分】', 1)
+  if len(free.strip()) < 450:
+   issues.append('無料部分が短すぎる')
+  if len(paid.strip()) < 2500:
+   issues.append('有料部分が短すぎる。要約ではなく全文が必要')
+  if any(x in paid for x in ('※以下は一部要約', '本編概要', 'ここに本文を', '以下省略')):
+   issues.append('有料部分に要約・省略の表現がある')
+ # テーマ欄は正式タイトルとは限らないため、文字列一致は強制しない。
+ return issues
+
+def audit_note(article, ctx):
+ """監査結果をJSONで受け取り、パース不能なら不合格とする。"""
+ prompt = ("あなたは原稿を修正しない独立監査担当。10観点（読者・需要・競合・独自性・具体性・実践性・価格・期待一致・表現・リスク）で厳格に評価。"
+  "有料部分が全文か、読者が具体的に判断・行動できるか、無料と有料の価値差があるかを重点検証。"
+  "市場需要・競合は外部調査していないため、検証済みと主張しない。"
+  "JSONオブジェクトのみ返す。形式: {\"passed\":false,\"issues\":[\"具体的な欠陥\"],\"fix_instructions\":\"修正すべき内容\"}。"
+  "重大な欠陥が一つでもあればpassedはfalse。")
+ raw = ai('audit', prompt, ctx + '\n監査対象全文:\n' + article, max_tokens=2500)
+ try:
+  data = json.loads(raw.strip().removeprefix('```json').removesuffix('```').strip())
+  if not isinstance(data, dict) or not isinstance(data.get('passed'), bool) or not isinstance(data.get('issues'), list):
+   raise ValueError('監査JSONの形式不正')
+ except (ValueError, TypeError):
+  data = {'passed': False, 'issues': ['監査結果を機械的に判定できませんでした'], 'fix_instructions': '監査形式を再確認してください'}
+ return data
+
+def repair_note(article, ctx, issues, report):
+ """全文の修正。監査担当とは独立してwriter OSを使用する。"""
+ instructions = ('次の欠陥をすべて修正し、【無料部分】と【有料部分】を含む完成原稿全文だけを出力。'
+  '要約・本編概要・省略は禁止。元の具体例や価値を削らない。'
+  '確定タイトルと価格は変更しない。根拠のない実績や保証を作らない。\n'
+  + '\n'.join('- ' + str(x) for x in issues) + '\n監査指示: ' + str(report.get('fix_instructions', '')))
+ return ai('writer', instructions, ctx + '\n修正対象の原稿全文:\n' + article, max_tokens=14000)
+
 def pipeline(run_id, config):
  try:
   topic = config.get('topic','note初心者向けの有料noteの作り方')
@@ -170,14 +211,30 @@ def pipeline(run_id, config):
   update(run_id, stage='需要調査')
   research = ai('research','このテーマの読者課題、競合との差別化仮説、記事設計を提案。実際の市場調査をしたと主張しない。',ctx)
   update(run_id, stage='記事制作・深層設計', research=research)
-  draft = create_paid_note(ctx, research)
-  update(run_id, stage='品質監査・修正', draft=draft)
-  # 既存の監査工程を維持する（監査OSは追加しない）。
-  article = ai('audit',
-   '10観点で厳格に監査し、問題点を短く列挙したあと、修正済みの完成原稿全文を出力する。',
-   ctx+'\n原稿:\n'+draft)
-  update(run_id, stage='SNS投稿準備', article=article)
-  social = ai('social','以下の原稿を宣伝するX向け投稿を3つ、Threads向けを2つ作成。投稿は実行しない。',ctx+'\n記事:\n'+draft[:12000]+'\nnote URL:'+config.get('note_url','未設定'))
+  article = create_paid_note(ctx, research)
+  update(run_id, stage='初稿完成', draft=article)
+  passed = False
+  for round_num in range(1, 4):
+   update(run_id, stage=f'独立品質監査 {round_num}/3')
+   structural_issues = validate_article(article, topic)
+   report = audit_note(article, ctx)
+   issues = structural_issues + [str(x) for x in report['issues']]
+   passed = report['passed'] and not issues
+   with LOCK, connect() as c:
+    c.execute('INSERT OR REPLACE INTO audit_reports(run_id,round,report,passed,created_at) VALUES(?,?,?,?,?)',
+      (run_id, round_num, json.dumps({'issues': issues, 'audit': report}, ensure_ascii=False), int(passed), now()))
+   if passed:
+    break
+   if round_num < 3:
+    update(run_id, stage=f'原稿修正 {round_num}/2')
+    article = repair_note(article, ctx, issues, report)
+  update(run_id, article=article)
+  if not passed:
+   update(run_id, stage='品質未達・要確認', status='needs_revision', error='3回の監査で合格できませんでした。監査記録と原稿を確認してください。')
+   return
+  update(run_id, stage='SNS投稿準備')
+  social = ai('social','以下の合格済み原稿を宣伝するX向け投稿を3つ、Threads向けを2つ作成。投稿は実行しない。',
+    ctx+'\n記事:\n'+article[:12000]+'\nnote URL:'+config.get('note_url','未設定'))
   update(run_id, stage='承認待ち', social=social, status='pending_approval')
  except Exception as exc:
   update(run_id, status='error', stage='失敗', error=str(exc)[:400])
