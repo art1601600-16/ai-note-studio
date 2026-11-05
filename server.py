@@ -30,7 +30,11 @@ CRITERIA = {
  'conversion':'冒頭・無料有料分担・購入導線', 'trust':'根拠・安全性・誇大表現の抑制'
 }
 EDITORIAL_KEYS = tuple(k for k in CRITERIA if k not in ('demand','competition'))
-TARGET_SCORE = 90
+TARGET_SCORE = 80  # 画面/API互換用の最低編集基準
+EDITORIAL_THRESHOLDS = {
+ 'reader':80, 'unique_value':80, 'specificity':90, 'practicality':90,
+ 'price':80, 'promise_match':90, 'conversion':80, 'trust':90
+}
 MAX_ROUNDS = max(1,min(int(os.getenv('MAX_AUDIT_ROUNDS','3')),5))
 WRITER_OS_PATH = ROOT / 'os' / 'writer.md'
 CHAPTER_MIN, CHAPTER_MAX = 5,7
@@ -185,7 +189,7 @@ def get_audits(rid:int,_:bool=Depends(auth)):
  for row in rows:
   try: row['report']=json.loads(row['report'])
   except (TypeError,ValueError): pass
- return {'run_id':rid,'target_score':TARGET_SCORE,'reports':rows}
+ return {'run_id':rid,'target_score':TARGET_SCORE,'editorial_thresholds':EDITORIAL_THRESHOLDS,'reports':rows}
 @app.post('/api/jobs')
 def job(payload:JobIn,_:bool=Depends(auth)):
  if payload.role not in ROLES: raise HTTPException(400,'Unknown role')
@@ -258,7 +262,8 @@ def audit_note(article,ctx):
   '形式:{"scores":{"reader":0,"demand":0,"competition":0,"unique_value":0,"specificity":0,"practicality":0,"price":0,"promise_match":0,"conversion":0,"trust":0},'
   '"evidence":{"reader":"本文の具体的根拠"},"issues":["軽微な改善提案"],"fix_instructions":"具体的な修正指示",'
   '"critical_failures":["重大欠陥のみ"],"affected_chapters":[1],"market_verified":false}\n'
-  'scoresは0〜100整数。90点は高水準。全観点を別々に評価し、本文に根拠がない評価は高得点にしない。'
+  'scoresは0〜100整数。各観点を独立評価し、本文に根拠がない評価は高得点にしない。'
+  '編集品質の合格基準は'+json.dumps(EDITORIAL_THRESHOLDS,ensure_ascii=False)+'。点数を基準に合わせて水増ししない。'
   'issuesは改善推奨であり、重大欠陥と区別する。critical_failuresは捏造・実践不能・誤解を招く重大問題だけ。'
   'affected_chaptersは実際に修正が必要な有料章番号のみ。無料部分の問題なら空配列。'
   '外部検索は未実施のためmarket_verified=false。需要・競合の外部根拠がなければ最大69点。'
@@ -279,10 +284,12 @@ def audit_note(article,ctx):
   data[key]=[str(x)[:500] for x in value[:30 if key=='issues' else 20]] if isinstance(value,list) else []
  data['evidence']=data.get('evidence',{}) if isinstance(data.get('evidence'),dict) else {}
  data['affected_chapters']=[x for x in data.get('affected_chapters',[]) if type(x) is int and 1<=x<=CHAPTER_MAX] if isinstance(data.get('affected_chapters'),list) else []
- data['below_target']={k:v for k,v in scores.items() if v<TARGET_SCORE}
- data['editorial_below_target']={k:scores[k] for k in EDITORIAL_KEYS if scores[k]<TARGET_SCORE}
+ data['below_target']={k:v for k,v in scores.items() if k in EDITORIAL_THRESHOLDS and v<EDITORIAL_THRESHOLDS[k]}
+ data['editorial_below_target']=dict(data['below_target'])
+ data['editorial_thresholds']=dict(EDITORIAL_THRESHOLDS)
  data['average_score']=round(sum(scores.values())/len(scores),1)
  data['editorial_passed']=not data['editorial_below_target'] and not data['critical_failures']
+ data['quality_status']='failed' if data['critical_failures'] else ('needs_improvement' if data['editorial_below_target'] else 'passed')
  data['passed']=data['editorial_passed']
  data['market_validation_required']=True
  data['market_status']='unverified'
@@ -295,7 +302,7 @@ def repair_note(article,ctx,structural_issues,report,facts=None):
  sections,prefix=split_chapters(paid)
  if prefix or not CHAPTER_MIN<=len(sections)<=CHAPTER_MAX: raise RuntimeError('章境界を安全に識別できないため自動改稿を停止しました')
  scores=report.get('scores',{})
- low=[k for k in EDITORIAL_KEYS if scores.get(k,0)<TARGET_SCORE]
+ low=[k for k in EDITORIAL_KEYS if scores.get(k,0)<EDITORIAL_THRESHOLDS[k]]
  feedback=json.dumps({'low_editorial_criteria':low,'structural_issues':structural_issues,'issues':report.get('issues',[]),'critical_failures':report.get('critical_failures',[]),'fix_instructions':report.get('fix_instructions','')},ensure_ascii=False)
  free_needed=bool(set(low)&{'reader','price','promise_match','conversion','trust'}) or any('無料' in x or 'タイトル' in x or '価格' in x for x in structural_issues)
  if free_needed:
@@ -337,6 +344,8 @@ def pipeline(run_id,config):
    report=audit_note(article,ctx)
    report['structural_issues']=structural_issues
    report['passed']=bool(report['editorial_passed'] and not structural_issues)
+   report['quality_status']=('failed' if structural_issues or report['critical_failures'] else
+                             'needs_improvement' if report['editorial_below_target'] else 'passed')
    passed=report['passed']
    persist_audit(run_id,round_num,report)
    if passed: break
